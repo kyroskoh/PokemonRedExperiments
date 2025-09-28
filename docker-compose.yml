@@ -1,0 +1,11 @@
+version: "3.9"
+
+services:
+  pokemonred:
+    build: .
+    container_name: pokemonred_container
+    working_dir: /app/baselines
+    volumes:
+      - .:/app
+    command: python run_pretrained_interactive.py
+    tty: true
