@@ -108,7 +108,7 @@ def progress_score(env: RedGymEnv) -> float:
 def safe_shutdown_env(env):
     """Aggressively and safely tear down PyBoy/SDL2 before respawn (Windows-friendly)."""
     try:
-        # stop recording writers first
+        # stop any video writers
         for wname in ("full_frame_writer", "model_frame_writer"):
             w = getattr(env, wname, None)
             if w:
@@ -120,7 +120,6 @@ def safe_shutdown_env(env):
         pb = getattr(env, "pyboy", None)
         if pb is not None:
             try:
-                # drop speed to 1 just in case, then stop
                 try:
                     pb.set_emulation_speed(1)
                 except Exception:
@@ -136,7 +135,7 @@ def safe_shutdown_env(env):
         # fully drop references and let SDL2 unload
         del env
         gc.collect()
-        time.sleep(0.2)
+        time.sleep(0.5)  # a bit longer to let SDL2 fully release
 
 
 def spawn_fresh_env(env, env_config, repo_root: Path):
@@ -202,6 +201,11 @@ class OscillationGuard:
             # trigger escape
             self.escape_left = self.escape_steps
 
+    def reset(self):
+        self.pos_hist.clear()
+        self.escape_left = 0
+        self.last_action = None
+
     def choose_action(self, proposed_action: int, env):
         """
         Return the final action to execute.
@@ -250,10 +254,11 @@ if __name__ == "__main__":
         model = PPO("CnnPolicy", env, verbose=1)
 
     # Long-horizon watchdog (no progress => respawn)
-    STUCK_WINDOW   = 3000   # steps without progress before respawn
-    REWARD_EPS     = 1e-4   # minimal reward improvement to count
-    MIN_EXPL_DELTA = 3      # minimal exploration increase to count
-    MAX_GENERATIONS = 50    # safety cap
+    STUCK_WINDOW    = 3000   # steps without progress before respawn
+    REWARD_EPS      = 1e-4   # minimal reward improvement to count
+    MIN_EXPL_DELTA  = 3      # minimal exploration increase to count
+    MAX_GENERATIONS = 50     # safety cap
+    GRACE_STEPS     = 512    # <-- NEW: don't count stagnation immediately after respawn
 
     # Short-horizon anti-oscillation guard
     osc_guard = OscillationGuard(window=160, min_unique=6, escape_steps=96)
@@ -262,6 +267,7 @@ if __name__ == "__main__":
     last_progress = progress_score(env)
     last_expl = explore_count(env)
     steps_since_progress = 0
+    steps_since_respawn = 0  # <-- NEW
 
     # Interactive loop (Gymnasium 5-tuple friendly)
     obs, _ = env.reset()
@@ -284,10 +290,12 @@ if __name__ == "__main__":
             print(f"\n[ERROR] PyBoy/SDL2 step error ({e}). Respawning env (generation {generation+1})…")
             env, env_config = spawn_fresh_env(env, env_config, REPO_ROOT)
             model.set_env(env)
+            osc_guard.reset()  # <-- NEW
             obs, _ = env.reset()
             last_progress = progress_score(env)
             last_expl = explore_count(env)
             steps_since_progress = 0
+            steps_since_respawn = 0  # <-- NEW
             generation += 1
             continue
 
@@ -307,13 +315,18 @@ if __name__ == "__main__":
             last_expl = cur_expl
             steps_since_progress = 0
         else:
-            steps_since_progress += 1
+            # only count “no progress” once grace period is over
+            if steps_since_respawn >= GRACE_STEPS:
+                steps_since_progress += 1
+
+        steps_since_respawn += 1  # <-- NEW
 
         # episode boundary
         if done:
             obs, _ = env.reset()
             # ease the watchdog a bit on episode reset
-            steps_since_progress = max(0, steps_since_progress - 256)
+            if steps_since_respawn >= GRACE_STEPS:
+                steps_since_progress = max(0, steps_since_progress - 256)
 
         # watchdog: respawn if stuck too long
         if steps_since_progress >= STUCK_WINDOW:
@@ -322,12 +335,14 @@ if __name__ == "__main__":
 
             env, env_config = spawn_fresh_env(env, env_config, REPO_ROOT)
             model.set_env(env)  # reuse weights with new env
+            osc_guard.reset()   # <-- NEW
 
             # reset trackers for the new generation
             obs, _ = env.reset()
             last_progress = progress_score(env)
             last_expl = explore_count(env)
             steps_since_progress = 0
+            steps_since_respawn = 0  # <-- NEW
             generation += 1
 
     print("[INFO] Max generations reached; exiting.")
