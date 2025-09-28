@@ -1,3 +1,4 @@
+# baselines/run_baseline_parallel_fast.py
 from pathlib import Path
 import os
 import uuid
@@ -11,8 +12,14 @@ from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
 from tensorboard_callback import TensorboardCallback
 
+# ==== Tunables (kept modest to avoid huge RAM) ====
+NUM_CPU = 16
+EP_LENGTH = 2048 * 10       # env_config["max_steps"] (per-env horizon)
+ROLLOUT_STEPS = 512         # << reduced rollout size to avoid multi-GB buffers
+BATCH_SIZE = 256            # pair well with ROLLOUT_STEPS
 
-# --- Utils -------------------------------------------------------------------
+
+# ----------------------------- helpers -----------------------------
 
 def make_env(rank, env_conf, seed=0):
     def _init():
@@ -23,19 +30,19 @@ def make_env(rank, env_conf, seed=0):
     return _init
 
 
-def create_vec_env(env_conf, num_cpu):
+def create_vec_env(env_conf, num_cpu: int):
     return SubprocVecEnv([make_env(i, env_conf) for i in range(num_cpu)])
 
 
 def close_vec_env(env):
-    """Ensure SubprocVecEnv is properly terminated"""
+    """Best-effort SubprocVecEnv cleanup."""
     try:
         env.close()
     except Exception:
         pass
 
 
-def build_env_config(repo_root, sess_path, extra_buttons=False):
+def build_env_config(repo_root: Path, sess_path: Path, extra_buttons: bool = False):
     DEFAULT_ROM = repo_root / "PokemonRed.gb"
     DEFAULT_STATE = repo_root / "has_pokedex_nballs.state"
 
@@ -53,7 +60,7 @@ def build_env_config(repo_root, sess_path, extra_buttons=False):
         "early_stop": False,
         "action_freq": 24,
         "init_state": str(init_state),
-        "max_steps": 2048 * 10,  # training horizon
+        "max_steps": EP_LENGTH,
         "print_rewards": True,
         "save_video": False,
         "fast_video": True,
@@ -63,89 +70,132 @@ def build_env_config(repo_root, sess_path, extra_buttons=False):
         "sim_frame_dist": 2_000_000.0,
         "use_screen_explore": True,
         "reward_scale": 4,
-        "extra_buttons": extra_buttons,
+        "extra_buttons": extra_buttons,   # 6 actions (False) vs 8 actions (True)
         "explore_weight": 3,
     }
 
 
-def safe_rebuild_env(env, env_config, num_cpu, extra_buttons):
-    """Kill old env, sleep briefly, rebuild with new extra_buttons setting"""
+def newest_checkpoint(repo_root: Path):
+    cands = sorted(
+        repo_root.rglob("poke_*_steps.zip"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return cands[0] if cands else None
+
+
+def safe_rebuild_env(env, env_config: dict, num_cpu: int, extra_buttons: bool):
+    """
+    Kill old env, pause briefly, rebuild with desired action-space.
+    This prevents mismatch loops and stale subprocess issues.
+    """
     close_vec_env(env)
-    time.sleep(1)
+    time.sleep(1.0)
     env_config["extra_buttons"] = extra_buttons
     return create_vec_env(env_config, num_cpu)
 
 
-# --- Main --------------------------------------------------------------------
+def safe_load_model(ckpt, env, env_config: dict, num_cpu: int):
+    """
+    Load PPO with small rollout/batch via custom_objects.
+    If action-space mismatch (8!=6 or 6!=8), rebuild env accordingly and retry once.
+    Returns (model, env) because env might be rebuilt.
+    """
+    try:
+        model = PPO.load(str(ckpt), env=env, custom_objects=dict(
+            n_steps=ROLLOUT_STEPS,
+            batch_size=BATCH_SIZE,
+        ))
+        return model, env
+    except ValueError as e:
+        msg = str(e)
+        m = re.search(r"Discrete\((\d+)\)\s*!=\s*Discrete\((\d+)\)", msg)
+        if not m:
+            raise
+        ckpt_actions, env_actions = int(m.group(1)), int(m.group(2))
+        print(f"[WARN] Action space mismatch: checkpoint={ckpt_actions} vs env={env_actions}")
+
+        # Case 1: ckpt=8, env=6 → use 8-action env
+        if ckpt_actions == 8 and env_actions == 6:
+            print("[INFO] Rebuilding env with extra_buttons=True …")
+            env = safe_rebuild_env(env, env_config, num_cpu, extra_buttons=True)
+
+        # Case 2: ckpt=6, env=8 → use 6-action env
+        elif ckpt_actions == 6 and env_actions == 8:
+            print("[INFO] Rebuilding env with extra_buttons=False …")
+            env = safe_rebuild_env(env, env_config, num_cpu, extra_buttons=False)
+        else:
+            # Unknown combo; re-raise
+            raise
+
+        # Retry once after rebuilding
+        model = PPO.load(str(ckpt), env=env, custom_objects=dict(
+            n_steps=ROLLOUT_STEPS,
+            batch_size=BATCH_SIZE,
+        ))
+        return model, env
+
+
+# ------------------------------ main ------------------------------
 
 if __name__ == "__main__":
-    THIS_FILE = Path(__file__).resolve()
-    REPO_ROOT = THIS_FILE.parents[1]
-
-    # Session folder
+    REPO_ROOT = Path(__file__).resolve().parents[1]
     sess_id = str(uuid.uuid4())[:8]
     sess_path = REPO_ROOT / f"session_{sess_id}"
     sess_path.mkdir(parents=True, exist_ok=True)
 
-    num_cpu = 16
+    # Start with 6-action env; safe_load_model will rebuild if checkpoint expects 8
     env_config = build_env_config(REPO_ROOT, sess_path, extra_buttons=False)
-    env = create_vec_env(env_config, num_cpu)
+    print(env_config)
 
-    checkpoint_callback = CheckpointCallback(
-        save_freq=env_config["max_steps"],
+    env = create_vec_env(env_config, NUM_CPU)
+
+    checkpoint_cb = CheckpointCallback(
+        save_freq=EP_LENGTH,
         save_path=sess_path,
-        name_prefix="poke"
+        name_prefix="poke",
     )
-    callbacks = [checkpoint_callback, TensorboardCallback(log_dir=str(sess_path))]
+    callbacks = [checkpoint_cb, TensorboardCallback(log_dir=str(sess_path))]
 
-    # --- Auto-pick newest checkpoint
-    candidates = sorted(
-        REPO_ROOT.rglob("poke_*_steps.zip"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
+    # Optional Weights & Biases (off by default)
+    use_wandb_logging = False
+    if use_wandb_logging:
+        import wandb
+        from wandb.integration.sb3 import WandbCallback
+        run = wandb.init(
+            project="pokemon-train",
+            id=sess_id,
+            config=env_config,
+            sync_tensorboard=True,
+            monitor_gym=True,
+            save_code=True,
+        )
+        callbacks.append(WandbCallback())
 
-    model = None
-    if candidates:
-        ckpt = candidates[0]
+    # Auto-pick newest checkpoint
+    ckpt = newest_checkpoint(REPO_ROOT)
+    if ckpt:
         print(f"[INFO] Resuming from checkpoint: {ckpt}")
-        try:
-            model = PPO.load(str(ckpt), env=env)
-        except ValueError as e:
-            msg = str(e)
-            m = re.search(r"Discrete\((\d+)\)\s*!=\s*Discrete\((\d+)\)", msg)
-            if m:
-                ckpt_actions, env_actions = int(m.group(1)), int(m.group(2))
-                print(f"[WARN] Action space mismatch: checkpoint={ckpt_actions} vs env={env_actions}")
-
-                if ckpt_actions == 8 and env_actions == 6:
-                    print("[INFO] Rebuilding env with extra_buttons=True …")
-                    env = safe_rebuild_env(env, env_config, num_cpu, True)
-                    model = PPO.load(str(ckpt), env=env)
-
-                elif ckpt_actions == 6 and env_actions == 8:
-                    print("[INFO] Rebuilding env with extra_buttons=False …")
-                    env = safe_rebuild_env(env, env_config, num_cpu, False)
-                    model = PPO.load(str(ckpt), env=env)
-                else:
-                    raise
-            else:
-                raise
+        model, env = safe_load_model(ckpt, env, env_config, NUM_CPU)
     else:
         print("[WARN] No checkpoints found — starting from scratch.")
         model = PPO(
             "CnnPolicy",
             env,
             verbose=1,
-            n_steps=1024,        # reduce memory
-            batch_size=256,      # reduce memory
+            n_steps=ROLLOUT_STEPS,      # reduced rollout size
+            batch_size=BATCH_SIZE,      # reduced batch size
             n_epochs=3,
             gamma=0.998,
             tensorboard_log=str(sess_path),
         )
 
-    # --- Training loop
+    # Train
+    total_timesteps = EP_LENGTH * NUM_CPU * 5000
     model.learn(
-        total_timesteps=env_config["max_steps"] * num_cpu * 5000,
-        callback=CallbackList(callbacks)
+        total_timesteps=total_timesteps,
+        callback=CallbackList(callbacks),
     )
+
+    if use_wandb_logging:
+        run.finish()
