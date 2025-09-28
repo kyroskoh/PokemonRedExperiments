@@ -29,7 +29,7 @@ Run the parallel baseline trainer:
 ```powershell
 .\RunBaseline.ps1
 ```
-+
+
 **Changes in v1 (`baselines/run_baseline_parallel_fast.py`):**
 - Fixed ROM/state paths (`REPO_ROOT / "PokemonRed.gb"`).
 - Auto-detects newest checkpoint with `rglob("poke_*_steps.zip")`.
