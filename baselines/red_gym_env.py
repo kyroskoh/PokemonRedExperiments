@@ -26,6 +26,19 @@ class RedGymEnv(Env):
     def __init__(
         self, config=None):
 
+        # --- resolve & validate paths (NEW) ---
+        self.s_path = Path(config['session_path'])  # ensure Path
+        self.s_path.mkdir(exist_ok=True)
+
+        self.gb_path = Path(config['gb_path']).expanduser().resolve()
+        self.init_state_path = Path(config['init_state']).expanduser().resolve()
+
+        if not self.gb_path.exists():
+            raise FileNotFoundError(f"ROM not found: {self.gb_path}")
+        if not self.init_state_path.exists():
+            raise FileNotFoundError(f"Init state not found: {self.init_state_path}")
+
+        # existing config reads (unchanged except we removed previous s_path line)
         self.debug = config['debug']
         self.s_path = config['session_path']
         self.save_final_state = config['save_final_state']
@@ -33,7 +46,7 @@ class RedGymEnv(Env):
         self.vec_dim = 4320 #1000
         self.headless = config['headless']
         self.num_elements = 20000 # max
-        self.init_state = config['init_state']
+        self.init_state = config['init_state']  # (kept for compatibility; not used after)
         self.act_freq = config['action_freq']
         self.max_steps = config['max_steps']
         self.early_stopping = config['early_stop']
@@ -101,7 +114,7 @@ class RedGymEnv(Env):
 
         #log_level("ERROR")
         self.pyboy = PyBoy(
-                config['gb_path'],
+                str(self.gb_path),              # <-- use absolute ROM path
                 debugging=False,
                 disable_input=False,
                 window_type=head,
@@ -118,7 +131,7 @@ class RedGymEnv(Env):
     def reset(self, seed=None, options=None):
         self.seed = seed
         # restart game, skipping credits
-        with open(self.init_state, "rb") as f:
+        with open(self.init_state_path, "rb") as f:   # <-- use absolute path
             self.pyboy.load_state(f)
         
         if self.use_screen_explore:
