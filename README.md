@@ -24,10 +24,6 @@ See how in [Training Broadcast](#training-broadcast) section
 
 ## Baseline Training
 
-- Run the baseline training script via PowerShell:
-- ```powershell
-- .\RunBaseline.ps1
-- ```
 ### v1 Baseline
 Run the parallel baseline trainer:
 ```powershell
