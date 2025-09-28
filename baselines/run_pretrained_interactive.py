@@ -4,6 +4,7 @@ import uuid
 import re
 import time
 import random
+import gc
 from collections import deque
 
 from red_gym_env import RedGymEnv
@@ -52,7 +53,7 @@ def build_env_config(repo_root, headless=False, extra_buttons=False):
         "sim_frame_dist": 2_000_000.0,
         "use_screen_explore": True,
         "reward_scale": 4,
-        "extra_buttons": extra_buttons,      # may flip to True to match checkpoint
+        "extra_buttons": extra_buttons,      # may flip True to match checkpoint
         "explore_weight": 3,
     }
 
@@ -104,13 +105,43 @@ def progress_score(env: RedGymEnv) -> float:
     return tr + ex
 
 
-def spawn_fresh_env(env, env_config, repo_root: Path):
-    """Close existing env and create a new one (new session folder)."""
+def safe_shutdown_env(env):
+    """Aggressively and safely tear down PyBoy/SDL2 before respawn (Windows-friendly)."""
     try:
-        env.close()
-    except Exception:
-        pass
-    time.sleep(0.1)
+        # stop recording writers first
+        for wname in ("full_frame_writer", "model_frame_writer"):
+            w = getattr(env, wname, None)
+            if w:
+                try:
+                    w.close()
+                except Exception:
+                    pass
+        # tell emulator to stop
+        pb = getattr(env, "pyboy", None)
+        if pb is not None:
+            try:
+                # drop speed to 1 just in case, then stop
+                try:
+                    pb.set_emulation_speed(1)
+                except Exception:
+                    pass
+                pb.stop(save=False)
+            except Exception:
+                pass
+    finally:
+        try:
+            env.close()
+        except Exception:
+            pass
+        # fully drop references and let SDL2 unload
+        del env
+        gc.collect()
+        time.sleep(0.2)
+
+
+def spawn_fresh_env(env, env_config, repo_root: Path):
+    """Close existing env cleanly and create a new one (new session folder)."""
+    safe_shutdown_env(env)
     new_conf = build_env_config(
         repo_root,
         headless=env_config["headless"],
@@ -245,7 +276,21 @@ if __name__ == "__main__":
         # Let guard override action during escape
         action = osc_guard.choose_action(proposed_action, env)
 
-        step_out = env.step(action)
+        # ---- step with SDL2-safe error handling ----
+        try:
+            step_out = env.step(action)
+        except OSError as e:
+            # SDL2/PyBoy sometimes throws on teardown; recover by respawning
+            print(f"\n[ERROR] PyBoy/SDL2 step error ({e}). Respawning env (generation {generation+1})…")
+            env, env_config = spawn_fresh_env(env, env_config, REPO_ROOT)
+            model.set_env(env)
+            obs, _ = env.reset()
+            last_progress = progress_score(env)
+            last_expl = explore_count(env)
+            steps_since_progress = 0
+            generation += 1
+            continue
+
         if len(step_out) == 5:
             obs, reward, terminated, truncated, info = step_out
             done = bool(terminated) or bool(truncated)
