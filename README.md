@@ -6,6 +6,66 @@ Stream your training session to a shared global game map using the [Broadcast Wr
 
 See how in [Training Broadcast](#training-broadcast) section
   
+## Baseline Updates (v1 & v2)
+
+### v1 (`baselines/run_baseline_parallel_fast.py`, `RunBaseline.ps1`)
+- Resolves ROM and state paths relative to the repo root (`PokemonRed.gb`, `has_pokedex_nballs.state`).
+- Auto-selects the newest checkpoint via `rglob("poke_*_steps.zip")`.
+- Rebuilds the environment when action spaces mismatch (6<->8 buttons) and tears down subprocesses safely first.
+- Watchdog now grants a 512-step grace period after respawn, resets anti-oscillation, and improves SDL2 teardown.
+- PPO rollout buffer reduced (`n_steps=512`, `batch_size=256`) to prevent 15GBmemory spikes while keeping TensorBoard logging intact.
+
+### v2 (`v2/baseline_fast_v2.py`, `RunBaselineV2.ps1`)
+- Built on the `StreamWrapper` so map streaming is on by default and lighter.
+- Faster, memory-savvy training with lower reward scale, coordinate rewards, and trimmed rollout size.
+- Keeps checkpoint auto-detect, action-space repair (6<->8), and safe `SubprocVecEnv` teardown from v1.
+- Compatible with TensorBoard and optional Weights & Biases logging.
+- Convenience PowerShell launcher targets Python 3.11 by default.
+
+## Baseline Training
+
+- Run the baseline training script via PowerShell:
+- ```powershell
+- .\RunBaseline.ps1
+- ```
+### v1 Baseline
+Run the parallel baseline trainer:
+```powershell
+.\RunBaseline.ps1
+```
++
+**Changes in v1 (`baselines/run_baseline_parallel_fast.py`):**
+- Fixed ROM/state paths (`REPO_ROOT / "PokemonRed.gb"`).
+- Auto-detects newest checkpoint with `rglob("poke_*_steps.zip")`.
+- Handles action-space mismatch (`Discrete(8) != Discrete(6)` and inverse) by rebuilding env with/without `extra_buttons`.
+- Safe SubprocVecEnv teardown before rebuild (prevents subprocess leaks).
+- Watchdog improvements:
+  - Grace period after respawn (ignores "no progress" for first 512 steps).
+  - Resets anti-oscillation guard after respawn.
+  - More robust SDL2 teardown with sleep/guard checks.
+- Reduced PPO rollout size (`n_steps=512`, `batch_size=256`) to avoid huge (15GB+) buffers.
+- Preserves SB3 TensorBoard logging and custom `TensorboardCallback`.
+
+### v2 Baseline
+Run the new v2 trainer:
+```powershell
+.\RunBaselineV2.ps1
+```
+**Changes in v2 (`v2/baseline_fast_v2.py`):**
+- Uses `StreamWrapper` to stream env state to map viewer.
+- Faster and leaner training:
+  - Coordinate-based exploration reward (replaces frame KNN).
+  - Lower reward scale tuned exploration.
+  - Optimized rollout size for speed and reduced memory.
+- Includes all fixes from v1 (checkpoint auto-detect, action-space handling, safe teardown, reduced rollout).
+- Supports TensorBoard and optional WandB logging.
+- Adds helper script `RunBaselineV2.ps1` to launch with Python 3.11.
+✅ **Impact:** Training is now faster, more stable, and uses less memory. Envs won’t get stuck oscillating, and v2 baseline provides improved exploration real-time streaming.
+
+
+**Impact**
+- Training stability improves, oscillations resolve automatically, and memory usage stays manageable.
+- v2 delivers richer rewards plus real-time streaming without extra setup, making it the recommended path going forward.
 ## Watch the Video on Youtube! 
 
 <p float="left">
@@ -21,7 +81,7 @@ See how in [Training Broadcast](#training-broadcast) section
 [![Join the Discord server!](https://invidget.switchblade.xyz/RvadteZk4G)](http://discord.gg/RvadteZk4G)
   
 ## Running the Pretrained Model Interactively 🎮  
-🐍 Python 3.10+ is recommended. Other versions may work but have not been tested.   
+🐍 Python 3.10is recommended. Other versions may work but have not been tested.   
 You also need to install ffmpeg and have it available in the command line.
 
 ### Windows Setup
@@ -125,3 +185,5 @@ Check out these awesome projects!
 <a href="https://github.com/DLR-RM/stable-baselines3">
   <img src="/assets/sblogo.png" height="64">
 </a>
+
+
